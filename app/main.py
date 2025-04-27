@@ -4,6 +4,10 @@ import os
 import uuid
 import aiofiles
 from pathlib import Path
+import redis.asyncio as redis  # Using async Redis client
+
+# Connect to Redis using your Redis URL
+redis_client = redis.from_url("rediss://default:AXOzAAIjcDEwYTNmNTYyNjQzMTI0ZTUyOWViYTY0YWQ0MDk3NzcwYnAxMA@touched-wallaby-29619.upstash.io:6379", decode_responses=False)
 
 app = FastAPI()
 
@@ -27,16 +31,14 @@ async def upload_video(
         session_dir = os.path.join(UPLOAD_DIR, upload_id)
         os.makedirs(session_dir, exist_ok=True)
 
-        # Save chunk
-        chunk_path = os.path.join(session_dir, f"chunk_{chunk_number:04d}")
-        async with aiofiles.open(chunk_path, "wb") as f:
-            while content := await file.read(CHUNK_SIZE):
-                await f.write(content)
+        # Save chunk into Redis
+        chunk_key = f"{upload_id}:{chunk_number:04d}"
+        content = await file.read()
+        await redis_client.set(chunk_key, content)
 
         # Check if all chunks arrived
         all_chunks = all(
-            os.path.exists(os.path.join(session_dir, f"chunk_{i:04d}"))
-            for i in range(total_chunks)
+            [await redis_client.exists(f"{upload_id}:{i:04d}") for i in range(total_chunks)]
         )
 
         if all_chunks:
@@ -44,14 +46,10 @@ async def upload_video(
             output_path = os.path.join(UPLOAD_DIR, f"{upload_id}.mp4")
             async with aiofiles.open(output_path, "wb") as outfile:
                 for i in range(total_chunks):
-                    chunk_path = os.path.join(session_dir, f"chunk_{i:04d}")
-                    async with aiofiles.open(chunk_path, "rb") as infile:
-                        await outfile.write(await infile.read())
-            
-            # Cleanup
-            for i in range(total_chunks):
-                os.remove(os.path.join(session_dir, f"chunk_{i:04d}"))
-            os.rmdir(session_dir)
+                    chunk_key = f"{upload_id}:{i:04d}"
+                    chunk_data = await redis_client.get(chunk_key)
+                    await outfile.write(chunk_data)
+                    await redis_client.delete(chunk_key)  # Clean up Redis
 
             return {"status": "complete", "path": output_path}
         
@@ -59,3 +57,4 @@ async def upload_video(
 
     except Exception as e:
         raise HTTPException(500, str(e))
+
